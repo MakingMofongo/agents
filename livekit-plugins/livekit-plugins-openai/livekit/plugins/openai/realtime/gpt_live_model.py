@@ -149,8 +149,8 @@ class _PendingTurn:
 
     caller_text: str
     voice_text: str = ""
-    voice_spoke: bool = False
-    voice_quiet_ms: int = 0
+    caller_turns: int = 0
+    """How many caller turns had ended when this one did."""
 
 
 @dataclass
@@ -480,15 +480,27 @@ class GPTLiveSession(
         self._backend_response_requested = False
         self._backend_request_event_id: str | None = None
         self._backend_requested_at = 0.0
+        # a request for a caller turn is answered by a response with no delegation; a request to
+        # continue is answered by the next response, which carries the delegation it continues
+        self._backend_request_continues = False
+        self._backend_recheck: asyncio.TimerHandle | None = None
         # delegations whose first backend response has not started, by id, with when they came
         self._delegations_starting: dict[str, float] = {}
         # caller turns the application sent to the backend while it was busy, oldest first
-        self._queued_backend_turns: list[tuple[str, bool]] = []
+        # (text, is a fallback, caller turns ended when it was decided)
+        self._queued_backend_turns: list[tuple[str, bool, int]] = []
 
         # missed-delegation recovery: the caller turn waiting on the voice model's reply, and how
         # many delegations the voice model has made, so a slow policy can see one arrive late
         self._pending_turn: _PendingTurn | None = None
         self._delegations_seen = 0
+        self._caller_turns_ended = 0
+        # the voice model's speech, followed on its audio: whether it is mid-reply, the quiet since
+        # it last spoke, and the delegation count when its last reply ended; a turn is missed only
+        # if no delegation at all came between the end of one reply and the end of the next
+        self._voice_speaking = False
+        self._voice_quiet_ms = 0
+        self._delegations_at_reply_end = 0
         self._decide_tasks: set[asyncio.Task[None]] = set()
         # after a fallback: when it started, whether the caller has finished another turn since,
         # its calls as (name, arguments) by call id, their results, and the delegation taken for
@@ -649,7 +661,13 @@ class GPTLiveSession(
         self._backend_request_event_id = None
         self._delegations_starting.clear()
         self._queued_backend_turns.clear()
+        if self._backend_recheck is not None:
+            self._backend_recheck.cancel()
+            self._backend_recheck = None
         self._pending_turn = None
+        self._voice_speaking = False
+        self._voice_quiet_ms = 0
+        self._delegations_at_reply_end = self._delegations_seen
         for task in list(self._decide_tasks):
             task.cancel()
         self._fallback_started_at = None
@@ -863,25 +881,36 @@ class GPTLiveSession(
         )
         with contextlib.suppress(utils.aio.channel.ChanClosed):
             self._audio_ch.send_nowait(llm.DuplexAudioFrame(frame=frame))
-        if (turn := self._pending_turn) is not None:
-            self._track_voice_reply(turn, data)
+        if self._opts.missed_delegation is not None:
+            self._track_voice(data)
 
-    def _track_voice_reply(self, turn: _PendingTurn, data: bytes) -> None:
-        # the reply ends on the model's audio, which is paced, not on its transcript, which runs
+    def _track_voice(self, data: bytes) -> None:
+        # a reply ends on the model's audio, which is paced, not on its transcript, which runs
         # ahead of it; every frame arrives, silence included, so a pause can be counted in samples
         samples = memoryview(data).cast("h")
         if not len(samples):
             return
         rms = (sum(x * x for x in samples) / len(samples)) ** 0.5 / 32768
         if rms > _SILENCE_RMS:
-            turn.voice_spoke = True
-            turn.voice_quiet_ms = 0
+            self._voice_speaking = True
+            self._voice_quiet_ms = 0
             return
-        if not turn.voice_spoke:
+        if not self._voice_speaking:
             return
-        turn.voice_quiet_ms += len(samples) * 1000 // SAMPLE_RATE
-        if turn.voice_quiet_ms >= _MIN_SILENCE_MS:
-            self._pending_turn = None
+        self._voice_quiet_ms += len(samples) * 1000 // SAMPLE_RATE
+        if self._voice_quiet_ms >= _MIN_SILENCE_MS:
+            self._voice_speaking = False
+            self._on_voice_reply_end()
+
+    def _on_voice_reply_end(self) -> None:
+        # a delegation anywhere since the last reply ended covers this turn: it can land before
+        # the caller's first fragment, or split their turn in two
+        delegated = self._delegations_seen != self._delegations_at_reply_end
+        self._delegations_at_reply_end = self._delegations_seen
+        if (turn := self._pending_turn) is None:
+            return
+        self._pending_turn = None
+        if not delegated:
             self._decide_missed_delegation(turn)
 
     def _handle_transcript_delta(self, role: Role, event: types.TranscriptDeltaEvent) -> None:
@@ -945,6 +974,7 @@ class GPTLiveSession(
         if (speech := self._speech.pop(role, None)) is None or role != "user":
             return
         if speech.text.strip():
+            self._caller_turns_ended += 1
             # the caller has moved on: a delegation from now on is for something new
             self._fallback_turn_open = False
         if (
@@ -954,12 +984,15 @@ class GPTLiveSession(
             and self._delegations_seen == speech.delegations_at_start
         ):
             if self._pending_turn is None:
-                self._pending_turn = _PendingTurn(caller_text=speech.text.strip())
+                self._pending_turn = _PendingTurn(
+                    caller_text=speech.text.strip(), caller_turns=self._caller_turns_ended
+                )
             else:
                 # the caller spoke again before the voice model finished replying: both turns
                 # are still undelegated, and the reply to judge is the one still to come
                 self._pending_turn = _PendingTurn(
-                    caller_text=f"{self._pending_turn.caller_text}\n{speech.text.strip()}"
+                    caller_text=f"{self._pending_turn.caller_text}\n{speech.text.strip()}",
+                    caller_turns=self._caller_turns_ended,
                 )
         # the final transcript goes out first, so nothing waits for one after the stop
         self.emit(
@@ -979,8 +1012,11 @@ class GPTLiveSession(
         delegation = event.delegation
         self._delegations_seen += 1
         self._pending_turn = None
-        # a fallback still waiting for the backend is the same turn: the delegation has it now
-        self._queued_backend_turns = [t for t in self._queued_backend_turns if not t[1]]
+        # a fallback still waiting for the backend, for a turn the caller has not moved on from,
+        # is that turn: the delegation has it now
+        self._queued_backend_turns = [
+            t for t in self._queued_backend_turns if not t[1] or t[2] != self._caller_turns_ended
+        ]
         if delegation.id and delegation.target != "client":
             self._delegations_starting[delegation.id] = time.monotonic()
         if (
@@ -1013,10 +1049,10 @@ class GPTLiveSession(
 
         if event.type == "response.created":
             self._backend_running_responses[d_id] = set()
-            if d_id is None:
+            if d_id is None or self._backend_request_continues:
                 self._backend_response_requested = False
                 self._backend_request_event_id = None
-            else:
+            if d_id is not None:
                 self._delegations_starting.pop(d_id, None)
 
         elif event.type == "response.output_item.done":
@@ -1121,10 +1157,11 @@ class GPTLiveSession(
             self._flush_backend_turns()
             return
         self._backend_response_pending = False
-        self._request_backend_response()
+        self._request_backend_response(continues=True)
 
-    def _request_backend_response(self) -> None:
+    def _request_backend_response(self, *, continues: bool) -> None:
         self._backend_response_requested = True
+        self._backend_request_continues = continues
         self._backend_requested_at = time.monotonic()
         self._backend_request_event_id = utils.shortuuid("response_create_")
         self.send_event(types.ResponseCreateEvent(event_id=self._backend_request_event_id))
@@ -1292,6 +1329,8 @@ class GPTLiveSession(
         self._msg_ch.close()
         for task in list(self._decide_tasks):
             task.cancel()
+        if self._backend_recheck is not None:
+            self._backend_recheck.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await self._main_atask
 
@@ -1400,15 +1439,30 @@ class GPTLiveSession(
         for its own delegations. The backend takes one request at a time, so a turn sent while
         it is busy goes out once the running work finishes.
         """
-        self._start_backend_turn(text, fallback=False)
+        self._start_backend_turn(text, fallback=False, caller_turns=self._caller_turns_ended)
 
-    def _start_backend_turn(self, text: str, *, fallback: bool) -> None:
+    def _start_backend_turn(self, text: str, *, fallback: bool, caller_turns: int) -> None:
         if self._opts.delegation != "responses":
             raise RuntimeError("start_backend_turn needs delegation='responses'")
         if not (text := text.strip()):
             return
-        self._queued_backend_turns.append((text, fallback))
+        self._queued_backend_turns.append((text, fallback, caller_turns))
         self._flush_backend_turns()
+
+    def _schedule_backend_recheck(self) -> None:
+        # a request that never starts is released on a timeout, and nothing else may come along
+        # to send what is queued behind it
+        if self._backend_recheck is not None or not self._queued_backend_turns:
+            return
+
+        def _recheck() -> None:
+            self._backend_recheck = None
+            self._flush_backend_turns()
+
+        with contextlib.suppress(RuntimeError):
+            self._backend_recheck = asyncio.get_running_loop().call_later(
+                _BACKEND_START_TIMEOUT_S + 0.5, _recheck
+            )
 
     def _backend_busy(self) -> bool:
         now = time.monotonic()
@@ -1431,9 +1485,12 @@ class GPTLiveSession(
         )
 
     def _flush_backend_turns(self) -> None:
-        if not self._queued_backend_turns or self._backend_busy():
+        if not self._queued_backend_turns:
             return
-        text, fallback = self._queued_backend_turns.pop(0)
+        if self._backend_busy():
+            self._schedule_backend_recheck()
+            return
+        text, fallback, _ = self._queued_backend_turns.pop(0)
         if fallback:
             self._fallback_started_at = time.monotonic()
             self._fallback_turn_open = True
@@ -1454,7 +1511,7 @@ class GPTLiveSession(
                 ),
             )
         )
-        self._request_backend_response()
+        self._request_backend_response(continues=False)
 
     def _decide_missed_delegation(self, turn: _PendingTurn) -> None:
         handler = self._opts.missed_delegation
@@ -1482,7 +1539,7 @@ class GPTLiveSession(
                 return
             if self._delegations_seen != seen:
                 return  # the voice model delegated while the policy was deciding
-            self._start_backend_turn(result, fallback=True)
+            self._start_backend_turn(result, fallback=True, caller_turns=turn.caller_turns)
 
         task = asyncio.create_task(_decide(), name="gpt_live_missed_delegation")
         self._decide_tasks.add(task)
