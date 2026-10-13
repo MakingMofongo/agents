@@ -2591,3 +2591,30 @@ async def test_a_delegation_after_the_caller_starts_a_new_turn_is_not_a_late_rep
     finally:
         await session.aclose()
         await model.aclose()
+
+
+async def test_a_reply_that_starts_before_the_callers_turn_closes_is_still_the_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The voice model usually answers before the caller's audio has been quiet long enough to
+    close their turn; that answer is the reply to judge, not something the caller spoke over."""
+    seen: list[str] = []
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(
+        api_key="sk-test", missed_delegation=lambda t: seen.append(t.voice_reply) or t.caller_text
+    )
+    session = await _started(model)
+    try:
+        session._handle_event(_transcript("user", "I want to cancel my appointment.", 0))
+        session.push_audio(_silence(300))
+        session._handle_event(_transcript("assistant", "Sure, I can help with that.", 500))
+        _voice_audio(session, speech_ms=300, silence_ms=0)  # the reply starts
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100)):
+            session.push_audio(_silence(100))  # now the caller's turn closes
+        _voice_audio(session, speech_ms=900, silence_ms=1000)
+        await asyncio.sleep(0.05)
+        assert seen == ["Sure, I can help with that."]
+        assert _backend_turns(ws) == ["I want to cancel my appointment."]
+    finally:
+        await session.aclose()
+        await model.aclose()

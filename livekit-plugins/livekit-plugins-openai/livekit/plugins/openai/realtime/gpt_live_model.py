@@ -504,6 +504,7 @@ class GPTLiveSession(
         # if no delegation at all came between the end of one reply and the end of the next
         self._voice_speaking = False
         self._voice_quiet_ms = 0
+        self._voice_started_at = 0.0
         self._delegations_at_reply_end = 0
         # what the voice model has said since the caller's last words, for the policy to read
         self._voice_text_since_caller = ""
@@ -899,6 +900,8 @@ class GPTLiveSession(
             return
         rms = (sum(x * x for x in samples) / len(samples)) ** 0.5 / 32768
         if rms > _SILENCE_RMS:
+            if not self._voice_speaking:
+                self._voice_started_at = time.time()
             self._voice_speaking = True
             self._voice_quiet_ms = 0
             return
@@ -1017,7 +1020,11 @@ class GPTLiveSession(
                     if previous is not None
                     else self._delegations_at_reply_end
                 ),
-                voice_mid_utterance=self._voice_speaking,
+                # spoken over only if the voice model was already talking when the caller began;
+                # it usually starts its reply before the caller's audio has gone quiet
+                voice_mid_utterance=(
+                    self._voice_speaking and self._voice_started_at <= speech.started_at
+                ),
             )
         # the final transcript goes out first, so nothing waits for one after the stop
         self.emit(
