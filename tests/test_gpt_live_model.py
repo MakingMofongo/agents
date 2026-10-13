@@ -2618,3 +2618,53 @@ async def test_a_reply_that_starts_before_the_callers_turn_closes_is_still_the_r
     finally:
         await session.aclose()
         await model.aclose()
+
+
+async def test_a_turn_met_with_silence_is_judged_without_a_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[gpt_live_model.MissedDelegation] = []
+    ws = _connect_hook(monkeypatch)
+    monkeypatch.setattr(gpt_live_model, "_SILENT_REPLY_TIMEOUT_S", 0.1)
+    model = GPTLiveModel(
+        api_key="sk-test", missed_delegation=lambda t: seen.append(t) or t.caller_text
+    )
+    session = await _started(model)
+    try:
+        _caller_turn(session, "I want to cancel my appointment.", 0)
+        _voice_audio(session, speech_ms=0, silence_ms=500)  # the voice says nothing
+        await asyncio.sleep(0.3)
+        assert [(t.caller_text, t.voice_reply) for t in seen] == [
+            ("I want to cancel my appointment.", "")
+        ]
+        assert _backend_turns(ws) == ["I want to cancel my appointment."]
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_reply_still_going_is_not_cut_short_by_the_silence_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+    _connect_hook(monkeypatch)
+    monkeypatch.setattr(gpt_live_model, "_SILENT_REPLY_TIMEOUT_S", 0.1)
+    model = GPTLiveModel(
+        api_key="sk-test", missed_delegation=lambda t: seen.append(t.voice_reply) or None
+    )
+    session = await _started(model)
+    try:
+        session._handle_event(_transcript("user", "I want to cancel my appointment.", 0))
+        session._handle_event(_transcript("assistant", "Sure, I can help with that.", 400))
+        _voice_audio(session, speech_ms=300, silence_ms=0)  # the reply starts early
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100)):
+            session.push_audio(_silence(100))
+        _voice_audio(session, speech_ms=500, silence_ms=0)  # still speaking past the check
+        await asyncio.sleep(0.3)
+        assert seen == []
+        _voice_audio(session, speech_ms=0, silence_ms=1000)
+        await asyncio.sleep(0.05)
+        assert seen == ["Sure, I can help with that."]
+    finally:
+        await session.aclose()
+        await model.aclose()

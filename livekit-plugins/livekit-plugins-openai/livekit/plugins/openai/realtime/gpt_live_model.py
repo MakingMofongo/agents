@@ -67,6 +67,9 @@ _LATE_DELEGATION_WINDOW_S = 20.0
 # a response.create, or a delegation's first response, that has not started after this long is
 # taken as lost, so it cannot hold the backend busy for the rest of the call
 _BACKEND_START_TIMEOUT_S = 10.0
+# a caller turn the voice model meets with silence this long is judged as if it had replied:
+# the caller is waiting, and no reply is coming to end
+_SILENT_REPLY_TIMEOUT_S = 3.0
 
 # session.closed carries the final usage; the service drains first
 _SESSION_CLOSE_TIMEOUT = 5.0
@@ -155,6 +158,8 @@ class _PendingTurn:
     """The delegation count when the voice model's last reply before this turn ended."""
     voice_mid_utterance: bool = False
     """The voice model was still talking when the turn ended: that utterance is not the reply."""
+    caller_started_at: float = 0.0
+    """Wall-clock time the caller began this turn."""
 
 
 @dataclass
@@ -248,7 +253,10 @@ class GPTLiveModel(llm.DuplexModel):
                 caller finished), this is called with a :class:`MissedDelegation`; the text it
                 returns is sent to the backend as the caller's turn, and ``None`` leaves the turn
                 alone. Deciding which turns needed the backend is the application's: the voice
-                model also skips the backend for turns that never needed it. Off by default.
+                model also skips the backend for turns that never needed it. A turn the voice
+                model meets with silence is judged after a few seconds instead. An async handler
+                can wait a moment before answering: a delegation that arrives meanwhile cancels
+                the fallback, since the voice model can delegate seconds late. Off by default.
         """
         if missed_delegation is not None and delegation != "responses":
             raise ValueError("missed_delegation needs delegation='responses'")
@@ -912,6 +920,23 @@ class GPTLiveSession(
             self._voice_speaking = False
             self._on_voice_reply_end()
 
+    def _arm_silent_reply_check(self, turn: _PendingTurn) -> None:
+        def _check() -> None:
+            # still waiting, and the voice model has said nothing since the caller began: a reply
+            # in progress, or one already over, is judged where it ends instead
+            if (
+                self._pending_turn is turn
+                and not turn.voice_mid_utterance
+                and not self._voice_speaking
+                and self._voice_started_at < turn.caller_started_at
+            ):
+                self._pending_turn = None
+                if self._delegations_seen == turn.delegations_before:
+                    self._decide_missed_delegation(turn)
+
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().call_later(_SILENT_REPLY_TIMEOUT_S, _check)
+
     def _on_voice_reply_end(self) -> None:
         self._delegations_at_reply_end = self._delegations_seen
         if (turn := self._pending_turn) is None:
@@ -1020,12 +1045,16 @@ class GPTLiveSession(
                     if previous is not None
                     else self._delegations_at_reply_end
                 ),
+                caller_started_at=(
+                    previous.caller_started_at if previous is not None else speech.started_at
+                ),
                 # spoken over only if the voice model was already talking when the caller began;
                 # it usually starts its reply before the caller's audio has gone quiet
                 voice_mid_utterance=(
                     self._voice_speaking and self._voice_started_at <= speech.started_at
                 ),
             )
+            self._arm_silent_reply_check(self._pending_turn)
         # the final transcript goes out first, so nothing waits for one after the stop
         self.emit(
             "input_audio_transcription_completed",
