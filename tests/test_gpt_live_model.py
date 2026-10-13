@@ -2102,9 +2102,11 @@ async def test_a_late_delegation_reuses_the_fallbacks_result_instead_of_running_
         await model.aclose()
 
 
-async def test_a_late_call_waits_for_the_fallbacks_own_call_to_finish(
+async def test_a_late_call_without_a_result_yet_runs_as_usual(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Nothing waits on the fallback's own call, which may fail or never answer: a repeat that
+    arrives before its result is dispatched, and nothing is left open."""
     ws = _connect_hook(monkeypatch)
     model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: t.caller_text)
     session = await _started(model)
@@ -2112,28 +2114,26 @@ async def test_a_late_call_waits_for_the_fallbacks_own_call_to_finish(
     session.on("function_call", calls.append)
     try:
         await _fallback_with_call(session, ws, calls)
+        session._handle_event(
+            _response_event(None, {"type": "response.failed", "response": {"id": "resp_fb"}})
+        )
         session._handle_event(_delegation_created("item_late"))
         session._handle_event(
             _response_event("item_late", {"type": "response.created", "response": {"id": "resp_l"}})
         )
         session._handle_event(_response_event("item_late", _function_call_done("call_late")))
-        assert [c.call_id for c in calls] == ["call_fb"]
+        assert [c.call_id for c in calls] == ["call_fb", "call_late"]
 
         await session._append_items(
             [
                 llm.FunctionCallOutput(
-                    call_id="call_fb", name="_get_weather", output="rainy", is_error=False
+                    call_id="call_late", name="_get_weather", output="rainy", is_error=False
                 )
             ]
         )
+        session._handle_event(_response_event("item_late", _completed("resp_l")))
         await asyncio.sleep(0.05)
-        answered = {
-            e["item"]["call_id"]: e["item"]["output"]
-            for e in ws.sent
-            if e["type"] == "response.item.create"
-            and e["item"].get("type") == "function_call_output"
-        }
-        assert answered == {"call_fb": "rainy", "call_late": "rainy"}
+        assert not session._backend_open_calls and not session._backend_running_responses
     finally:
         await session.aclose()
         await model.aclose()
@@ -2202,6 +2202,131 @@ async def test_a_refused_response_request_does_not_hold_the_backend_busy(
                 },
             }
         )
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == ["first", "second"]
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_turn_delegated_before_the_caller_went_quiet_is_not_judged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The voice model often delegates while the caller's audio is still trailing off."""
+    seen: list[gpt_live_model.MissedDelegation] = []
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: seen.append(t) or "x")
+    session = await _started(model)
+    try:
+        session._handle_event(_transcript("user", "Cancel my appointment.", 0))
+        session._handle_event(_delegation_created("item_d1"))
+        for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100)):
+            session.push_audio(_silence(100))
+        session._handle_event(_transcript("assistant", "One moment.", 1000))
+        _voice_audio(session, speech_ms=600, silence_ms=1000)
+        await asyncio.sleep(0.05)
+        assert seen == [] and _backend_turns(ws) == []
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_queued_fallback_is_dropped_when_the_voice_delegates_after_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: t.caller_text)
+    session = await _started(model)
+    try:
+        session._handle_event(
+            _response_event("item_prev", {"type": "response.created", "response": {"id": "rp"}})
+        )
+        _caller_turn(session, "Cancel my order.", 0)
+        session._handle_event(_transcript("assistant", "Sure.", 1000))
+        _voice_audio(session, speech_ms=500, silence_ms=1000)
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == []  # queued behind the running response
+
+        session._handle_event(_delegation_created("item_late"))
+        session._handle_event(_response_event("item_prev", _completed("rp")))
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == []
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_new_request_after_the_caller_spoke_again_always_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the caller finishes another turn, a delegation is for something new, even when it
+    repeats the fallback's call exactly ("add one ticket", then "add another one")."""
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: t.caller_text)
+    session = await _started(model)
+    calls: list[llm.FunctionCall] = []
+    session.on("function_call", calls.append)
+    try:
+        await _fallback_with_call(session, ws, calls)
+        await session._append_items(
+            [
+                llm.FunctionCallOutput(
+                    call_id="call_fb", name="_get_weather", output="rainy", is_error=False
+                )
+            ]
+        )
+        session._handle_event(_response_event(None, _completed("resp_fb")))
+        _caller_turn(session, "And again for Paris.", 5000)
+        session._handle_event(_delegation_created("item_new"))
+        session._handle_event(
+            _response_event("item_new", {"type": "response.created", "response": {"id": "rn"}})
+        )
+        session._handle_event(_response_event("item_new", _function_call_done("call_new")))
+        assert [c.call_id for c in calls] == ["call_fb", "call_new"]
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_late_repeat_matches_whatever_the_argument_spacing_or_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: t.caller_text)
+    session = await _started(model)
+    calls: list[llm.FunctionCall] = []
+    session.on("function_call", calls.append)
+    try:
+        await _fallback_with_call(session, ws, calls)
+        await session._append_items(
+            [
+                llm.FunctionCallOutput(
+                    call_id="call_fb", name="_get_weather", output="rainy", is_error=False
+                )
+            ]
+        )
+        session._handle_event(_response_event(None, _completed("resp_fb")))
+        session._handle_event(_delegation_created("item_late"))
+        late = _function_call_done("call_late")
+        late["item"]["arguments"] = '{ "location":"Paris" }'
+        session._handle_event(_response_event("item_late", late))
+        assert [c.call_id for c in calls] == ["call_fb"]
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_lost_response_request_stops_holding_the_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _connect_hook(monkeypatch)
+    monkeypatch.setattr(gpt_live_model, "_BACKEND_START_TIMEOUT_S", 0.1)
+    model = GPTLiveModel(api_key="sk-test")
+    session = await _started(model)
+    try:
+        session.start_backend_turn("first")
+        await asyncio.sleep(0.2)  # no response.created and no error ever arrives
+        session.start_backend_turn("second")
         await asyncio.sleep(0.05)
         assert _backend_turns(ws) == ["first", "second"]
     finally:

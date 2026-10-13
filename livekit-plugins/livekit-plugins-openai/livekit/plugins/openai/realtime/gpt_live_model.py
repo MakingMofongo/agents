@@ -64,6 +64,9 @@ _ASK_BARE = f"Reply to the caller now. {_SPEAK_NOW}"
 # late one of the same turn: measured on GPT Live, a delegation can lag the caller by 4.5 s, and
 # one held back until the caller spoke again landed 10-15 s later
 _LATE_DELEGATION_WINDOW_S = 20.0
+# a response.create, or a delegation's first response, that has not started after this long is
+# taken as lost, so it cannot hold the backend busy for the rest of the call
+_BACKEND_START_TIMEOUT_S = 10.0
 
 # session.closed carries the final usage; the service drains first
 _SESSION_CLOSE_TIMEOUT = 5.0
@@ -132,6 +135,14 @@ MissedDelegationHandler = Callable[[MissedDelegation], "str | None | Awaitable[s
 """Return the text to send to the backend as the caller's turn, or ``None`` to leave it."""
 
 
+def _canonical_arguments(arguments: str) -> str:
+    """Arguments as JSON with sorted keys, so a repeat matches whatever its spacing or order."""
+    try:
+        return json.dumps(json.loads(arguments), sort_keys=True, separators=(",", ":"))
+    except ValueError:
+        return arguments
+
+
 @dataclass
 class _PendingTurn:
     """A finished caller turn not yet delegated, waiting for the voice model's reply to end."""
@@ -152,6 +163,8 @@ class _Speech:
     started_at: float = field(default_factory=time.time)
     quiet_ms: int = 0
     """Input audio pushed since the user's last fragment."""
+    delegations_at_start: int = 0
+    """How many delegations the voice model had made when this speech began."""
 
 
 # Responses delegation hands work to a backend Responses model, whose events arrive wrapped in
@@ -466,6 +479,9 @@ class GPTLiveSession(
         # Its event id ties a refusal of it back here, so the backend is not held busy forever
         self._backend_response_requested = False
         self._backend_request_event_id: str | None = None
+        self._backend_requested_at = 0.0
+        # delegations whose first backend response has not started, by id, with when they came
+        self._delegations_starting: dict[str, float] = {}
         # caller turns the application sent to the backend while it was busy, oldest first
         self._queued_backend_turns: list[tuple[str, bool]] = []
 
@@ -474,14 +490,14 @@ class GPTLiveSession(
         self._pending_turn: _PendingTurn | None = None
         self._delegations_seen = 0
         self._decide_tasks: set[asyncio.Task[None]] = set()
-        # after a fallback: when it started, its calls as (name, arguments) by call id, their
-        # results by (name, arguments), the delegations taken for late repeats of its turn, and
-        # their calls still waiting on a result
+        # after a fallback: when it started, whether the caller has finished another turn since,
+        # its calls as (name, arguments) by call id, their results, and the delegation taken for
+        # a late repeat of its turn
         self._fallback_started_at: float | None = None
+        self._fallback_turn_open = False
         self._fallback_calls: dict[str, tuple[str, str]] = {}
         self._fallback_results: dict[tuple[str, str], str] = {}
         self._late_delegations: set[str] = set()
-        self._late_calls_waiting: dict[tuple[str, str], list[str]] = {}
 
         # the newest history item the last ask was about, so an ask never repeats one
         self._asked_item_id: str | None = None
@@ -631,13 +647,16 @@ class GPTLiveSession(
         self._backend_response_pending = False
         self._backend_response_requested = False
         self._backend_request_event_id = None
+        self._delegations_starting.clear()
         self._queued_backend_turns.clear()
         self._pending_turn = None
+        for task in list(self._decide_tasks):
+            task.cancel()
         self._fallback_started_at = None
+        self._fallback_turn_open = False
         self._fallback_calls.clear()
         self._fallback_results.clear()
         self._late_delegations.clear()
-        self._late_calls_waiting.clear()
         self._usage_total = types.Usage()
         self._session_id = None
 
@@ -879,7 +898,9 @@ class GPTLiveSession(
             self._end_speech(role)
             speech = None
         if speech is None:
-            speech = self._speech[role] = _Speech(message_id=utils.shortuuid("speech_"))
+            speech = self._speech[role] = _Speech(
+                message_id=utils.shortuuid("speech_"), delegations_at_start=self._delegations_seen
+            )
             self._history.insert(
                 llm.ChatMessage(
                     id=speech.message_id,
@@ -923,7 +944,15 @@ class GPTLiveSession(
         """Close a speaker's message; for the user this is the end of their turn."""
         if (speech := self._speech.pop(role, None)) is None or role != "user":
             return
-        if self._opts.missed_delegation is not None and speech.text.strip():
+        if speech.text.strip():
+            # the caller has moved on: a delegation from now on is for something new
+            self._fallback_turn_open = False
+        if (
+            self._opts.missed_delegation is not None
+            and speech.text.strip()
+            # the voice model often delegates before the caller's audio has gone quiet
+            and self._delegations_seen == speech.delegations_at_start
+        ):
             if self._pending_turn is None:
                 self._pending_turn = _PendingTurn(caller_text=speech.text.strip())
             else:
@@ -950,9 +979,18 @@ class GPTLiveSession(
         delegation = event.delegation
         self._delegations_seen += 1
         self._pending_turn = None
-        if delegation.id and self._in_late_delegation_window():
-            # the backend already has this turn from the fallback; calls this delegation repeats
-            # get the fallback's results rather than running again
+        # a fallback still waiting for the backend is the same turn: the delegation has it now
+        self._queued_backend_turns = [t for t in self._queued_backend_turns if not t[1]]
+        if delegation.id and delegation.target != "client":
+            self._delegations_starting[delegation.id] = time.monotonic()
+        if (
+            delegation.id
+            and self._fallback_turn_open
+            and not self._late_delegations
+            and self._in_late_delegation_window()
+        ):
+            # a late delegation of the turn the fallback already sent: calls it repeats get the
+            # fallback's results rather than running again
             self._late_delegations.add(delegation.id)
         if not delegation.id:
             logger.warning("gpt-live delegation has no id; nothing can answer it")
@@ -975,8 +1013,11 @@ class GPTLiveSession(
 
         if event.type == "response.created":
             self._backend_running_responses[d_id] = set()
-            self._backend_response_requested = False
-            self._backend_request_event_id = None
+            if d_id is None:
+                self._backend_response_requested = False
+                self._backend_request_event_id = None
+            else:
+                self._delegations_starting.pop(d_id, None)
 
         elif event.type == "response.output_item.done":
             # only the completed item carries the name, call id and arguments together
@@ -1005,16 +1046,13 @@ class GPTLiveSession(
                 return
             calls.add(item.call_id)
 
-            key = (item.name, item.arguments)
-            if d_id is None and self._in_late_delegation_window():
+            key = (item.name, _canonical_arguments(item.arguments))
+            if d_id is None and self._fallback_turn_open:
                 self._fallback_calls[item.call_id] = key
             elif d_id is not None and d_id in self._late_delegations:
-                if (result := self._fallback_results.get(key)) is not None:
+                # each result answers one repeat; a call without a result yet runs as usual
+                if (result := self._fallback_results.pop(key, None)) is not None:
                     self._answer_late_call(item.call_id, item.name, result)
-                    return
-                if any(k == key for k in self._fallback_calls.values()):
-                    # the fallback's own call is still running: answer this one with its result
-                    self._late_calls_waiting.setdefault(key, []).append(item.call_id)
                     return
 
             fnc_call = llm.FunctionCall(
@@ -1087,6 +1125,7 @@ class GPTLiveSession(
 
     def _request_backend_response(self) -> None:
         self._backend_response_requested = True
+        self._backend_requested_at = time.monotonic()
         self._backend_request_event_id = utils.shortuuid("response_create_")
         self.send_event(types.ResponseCreateEvent(event_id=self._backend_request_event_id))
 
@@ -1309,10 +1348,8 @@ class GPTLiveSession(
 
         for output in backend_outputs:
             self._send_backend_output(output.call_id, output.output)
-            if (key := self._fallback_calls.get(output.call_id)) is not None:
+            if (key := self._fallback_calls.pop(output.call_id, None)) is not None:
                 self._fallback_results[key] = output.output
-                for waiting in self._late_calls_waiting.pop(key, []):
-                    self._send_backend_output(waiting, output.output)
         if backend_outputs:
             if silenced := [o.name or o.call_id for o in backend_outputs if not o.reply_required]:
                 logger.warning(
@@ -1374,11 +1411,23 @@ class GPTLiveSession(
         self._flush_backend_turns()
 
     def _backend_busy(self) -> bool:
+        now = time.monotonic()
+        if (
+            self._backend_response_requested
+            and now - self._backend_requested_at > _BACKEND_START_TIMEOUT_S
+        ):
+            logger.warning("gpt-live backend response request never started; releasing it")
+            self._backend_response_requested = False
+            self._backend_request_event_id = None
+        for d_id, at in list(self._delegations_starting.items()):
+            if now - at > _BACKEND_START_TIMEOUT_S:
+                del self._delegations_starting[d_id]
         return bool(
             self._backend_running_responses
             or self._backend_open_calls
             or self._backend_response_pending
             or self._backend_response_requested
+            or self._delegations_starting
         )
 
     def _flush_backend_turns(self) -> None:
@@ -1387,10 +1436,10 @@ class GPTLiveSession(
         text, fallback = self._queued_backend_turns.pop(0)
         if fallback:
             self._fallback_started_at = time.monotonic()
+            self._fallback_turn_open = True
             self._fallback_calls.clear()
             self._fallback_results.clear()
             self._late_delegations.clear()
-            self._late_calls_waiting.clear()
         logger.debug(
             "gpt-live starting a backend turn",
             extra={"fallback": fallback, "lk.pii.text": text},
@@ -1422,6 +1471,12 @@ class GPTLiveSession(
                     result = await result
             except Exception:
                 logger.exception("gpt-live missed_delegation handler failed")
+                return
+            if result is not None and not isinstance(result, str):
+                logger.warning(
+                    "gpt-live missed_delegation must return a str or None",
+                    extra={"returned": type(result).__name__},
+                )
                 return
             if not result:
                 return
