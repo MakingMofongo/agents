@@ -151,6 +151,10 @@ class _PendingTurn:
     voice_text: str = ""
     caller_turns: int = 0
     """How many caller turns had ended when this one did."""
+    delegations_before: int = 0
+    """The delegation count when the voice model's last reply before this turn ended."""
+    voice_mid_utterance: bool = False
+    """The voice model was still talking when the turn ended: that utterance is not the reply."""
 
 
 @dataclass
@@ -501,6 +505,8 @@ class GPTLiveSession(
         self._voice_speaking = False
         self._voice_quiet_ms = 0
         self._delegations_at_reply_end = 0
+        # what the voice model has said since the caller's last words, for the policy to read
+        self._voice_text_since_caller = ""
         self._decide_tasks: set[asyncio.Task[None]] = set()
         # after a fallback: when it started, whether the caller has finished another turn since,
         # its calls as (name, arguments) by call id, their results, and the delegation taken for
@@ -668,6 +674,7 @@ class GPTLiveSession(
         self._voice_speaking = False
         self._voice_quiet_ms = 0
         self._delegations_at_reply_end = self._delegations_seen
+        self._voice_text_since_caller = ""
         for task in list(self._decide_tasks):
             task.cancel()
         self._fallback_started_at = None
@@ -903,14 +910,19 @@ class GPTLiveSession(
             self._on_voice_reply_end()
 
     def _on_voice_reply_end(self) -> None:
-        # a delegation anywhere since the last reply ended covers this turn: it can land before
-        # the caller's first fragment, or split their turn in two
-        delegated = self._delegations_seen != self._delegations_at_reply_end
         self._delegations_at_reply_end = self._delegations_seen
         if (turn := self._pending_turn) is None:
             return
+        if turn.voice_mid_utterance:
+            # the caller spoke over this utterance, which began before their turn; the reply
+            # to judge is the next one
+            turn.voice_mid_utterance = False
+            turn.voice_text = ""
+            return
         self._pending_turn = None
-        if not delegated:
+        # a delegation anywhere since the voice model's previous reply ended covers this turn:
+        # it can land before the caller's first fragment, or split their turn in two
+        if self._delegations_seen == turn.delegations_before:
             self._decide_missed_delegation(turn)
 
     def _handle_transcript_delta(self, role: Role, event: types.TranscriptDeltaEvent) -> None:
@@ -940,7 +952,13 @@ class GPTLiveSession(
                 )
             )
             if role == "user":
+                # the caller is on a new turn: a delegation from now on is for something new
+                self._fallback_turn_open = False
                 self.emit("input_speech_started", llm.InputSpeechStartedEvent())
+        if role == "user":
+            self._voice_text_since_caller = ""
+        else:
+            self._voice_text_since_caller += event.delta
         speech.text += event.delta
         speech.quiet_ms = 0
         if event.end_ms is not None:
@@ -983,17 +1001,24 @@ class GPTLiveSession(
             # the voice model often delegates before the caller's audio has gone quiet
             and self._delegations_seen == speech.delegations_at_start
         ):
-            if self._pending_turn is None:
-                self._pending_turn = _PendingTurn(
-                    caller_text=speech.text.strip(), caller_turns=self._caller_turns_ended
-                )
-            else:
+            previous = self._pending_turn
+            self._pending_turn = _PendingTurn(
                 # the caller spoke again before the voice model finished replying: both turns
                 # are still undelegated, and the reply to judge is the one still to come
-                self._pending_turn = _PendingTurn(
-                    caller_text=f"{self._pending_turn.caller_text}\n{speech.text.strip()}",
-                    caller_turns=self._caller_turns_ended,
-                )
+                caller_text=(
+                    f"{previous.caller_text}\n{speech.text.strip()}"
+                    if previous is not None
+                    else speech.text.strip()
+                ),
+                voice_text=self._voice_text_since_caller,
+                caller_turns=self._caller_turns_ended,
+                delegations_before=(
+                    previous.delegations_before
+                    if previous is not None
+                    else self._delegations_at_reply_end
+                ),
+                voice_mid_utterance=self._voice_speaking,
+            )
         # the final transcript goes out first, so nothing waits for one after the stop
         self.emit(
             "input_audio_transcription_completed",
@@ -1012,11 +1037,10 @@ class GPTLiveSession(
         delegation = event.delegation
         self._delegations_seen += 1
         self._pending_turn = None
-        # a fallback still waiting for the backend, for a turn the caller has not moved on from,
-        # is that turn: the delegation has it now
-        self._queued_backend_turns = [
-            t for t in self._queued_backend_turns if not t[1] or t[2] != self._caller_turns_ended
-        ]
+        # a fallback still waiting for the backend is dropped: either this delegation is that
+        # turn, or the conversation has moved on and the fallback is stale ("cancel it", then
+        # "actually, keep it")
+        self._queued_backend_turns = [t for t in self._queued_backend_turns if not t[1]]
         if delegation.id and delegation.target != "client":
             self._delegations_starting[delegation.id] = time.monotonic()
         if (
@@ -1049,7 +1073,12 @@ class GPTLiveSession(
 
         if event.type == "response.created":
             self._backend_running_responses[d_id] = set()
-            if d_id is None or self._backend_request_continues:
+            # a delegation's first response is not the continuation the plugin asked for, even
+            # when the service starts it first
+            answers_request = d_id is None or (
+                self._backend_request_continues and d_id not in self._delegations_starting
+            )
+            if answers_request:
                 self._backend_response_requested = False
                 self._backend_request_event_id = None
             if d_id is not None:
@@ -1450,22 +1479,35 @@ class GPTLiveSession(
         self._flush_backend_turns()
 
     def _schedule_backend_recheck(self) -> None:
-        # a request that never starts is released on a timeout, and nothing else may come along
-        # to send what is queued behind it
-        if self._backend_recheck is not None or not self._queued_backend_turns:
+        # a request or delegation that never starts is released on a timeout, and nothing else
+        # may come along to send what is queued behind it; running work ends with an event
+        if (
+            self._backend_recheck is not None
+            or not self._queued_backend_turns
+            or self._backend_running_responses
+            or self._backend_open_calls
+        ):
             return
+        started = list(self._delegations_starting.values())
+        if self._backend_response_requested:
+            started.append(self._backend_requested_at)
+        if not started:
+            return
+        delay = max(0.05, min(started) + _BACKEND_START_TIMEOUT_S - time.monotonic() + 0.05)
 
         def _recheck() -> None:
             self._backend_recheck = None
             self._flush_backend_turns()
 
         with contextlib.suppress(RuntimeError):
-            self._backend_recheck = asyncio.get_running_loop().call_later(
-                _BACKEND_START_TIMEOUT_S + 0.5, _recheck
-            )
+            self._backend_recheck = asyncio.get_running_loop().call_later(delay, _recheck)
 
     def _backend_busy(self) -> bool:
         now = time.monotonic()
+        if self._backend_running_responses or self._backend_open_calls:
+            # a delegation waits its turn behind running work; its start timeout counts from idle
+            for d_id in self._delegations_starting:
+                self._delegations_starting[d_id] = now
         if (
             self._backend_response_requested
             and now - self._backend_requested_at > _BACKEND_START_TIMEOUT_S
