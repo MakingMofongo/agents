@@ -4,6 +4,8 @@ from .gpt_live_model import (
     GPTLiveModel,
     GPTLiveSession,
     GPTLiveVoices,
+    MissedDelegation,
+    MissedDelegationHandler,
     ResponsesDelegationOptions,
 )
 from .inference_realtime_model import InferenceRealtimeModel
@@ -17,6 +19,8 @@ __all__ = [
     "GPTLiveSession",
     "GPTLiveDelegation",
     "GPTLiveVoices",
+    "MissedDelegation",
+    "MissedDelegationHandler",
     "ResponsesDelegationOptions",
 ]
 

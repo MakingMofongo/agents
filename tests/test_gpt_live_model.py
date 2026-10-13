@@ -1819,3 +1819,391 @@ def test_with_azure_does_not_accept_the_openai_key(monkeypatch: pytest.MonkeyPat
         "Missing Azure credentials. Pass api_key or entra_token, "
         "or set the AZURE_OPENAI_API_KEY environment variable"
     )
+
+
+# missed delegation
+
+
+def _backend_turns(ws: _FakeWS) -> list[str]:
+    return [
+        e["item"]["content"][0]["text"]
+        for e in ws.sent
+        if e["type"] == "response.item.create" and e["item"].get("type") == "message"
+    ]
+
+
+def _delegation_created(delegation_id: str) -> dict[str, Any]:
+    return {
+        "type": "session.delegation.created",
+        "delegation": {"id": delegation_id, "type": "delegation", "target": "responses"},
+    }
+
+
+def _voice_audio(session: GPTLiveSession, *, speech_ms: int, silence_ms: int) -> None:
+    """The voice model's audio: speech, then silence, in 100 ms frames as the service sends it."""
+    for level, total in ((0.1, speech_ms), (0.0, silence_ms)):
+        for _ in range(total // 100):
+            data = _pcm(level).data.tobytes()
+            session._handle_event(
+                {"type": "session.output_audio.delta", "delta": base64.b64encode(data).decode()}
+            )
+
+
+def _caller_turn(session: GPTLiveSession, text: str, start_ms: int) -> None:
+    """A caller's words, closed by their own quiet audio."""
+    session._handle_event(_transcript("user", text, start_ms))
+    for _ in range(int(gpt_live_model._MIN_SILENCE_MS // 100)):
+        session.push_audio(_silence(100))
+
+
+async def _started(model: GPTLiveModel) -> GPTLiveSession:
+    session = model.session()
+    await session._update_session(tools=[_get_weather])
+    await asyncio.sleep(0.05)
+    return session
+
+
+async def test_a_missed_delegation_does_nothing_unless_the_app_opts_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test")
+    session = await _started(model)
+    try:
+        _caller_turn(session, "Please cancel it.", 0)
+        session._handle_event(_transcript("assistant", "Sure, I'll take care of it.", 1200))
+        _voice_audio(session, speech_ms=1500, silence_ms=2000)
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == []
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_the_app_decides_a_turn_the_voice_answered_without_delegating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the voice model's reply ends in its audio, the app sees the caller's words and the
+    reply; what it returns goes to the backend as the caller's turn."""
+    ws = _connect_hook(monkeypatch)
+    seen: list[gpt_live_model.MissedDelegation] = []
+
+    def policy(turn: gpt_live_model.MissedDelegation) -> str | None:
+        seen.append(turn)
+        return turn.caller_text
+
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=policy)
+    session = await _started(model)
+    try:
+        _caller_turn(session, "Yes, that one. Please cancel.", 0)
+        session._handle_event(_transcript("assistant", "Sure. I'll take care of it.", 1200))
+
+        # still speaking, then a pause shorter than the end of a reply: nothing decided yet
+        _voice_audio(session, speech_ms=1500, silence_ms=int(gpt_live_model._MIN_SILENCE_MS) - 100)
+        await asyncio.sleep(0.05)
+        assert seen == []
+
+        _voice_audio(session, speech_ms=0, silence_ms=200)
+        await asyncio.sleep(0.05)
+        assert [(t.caller_text, t.voice_reply) for t in seen] == [
+            ("Yes, that one. Please cancel.", "Sure. I'll take care of it.")
+        ]
+        assert _backend_turns(ws) == ["Yes, that one. Please cancel."]
+        turn = next(i for i, e in enumerate(ws.sent) if e["type"] == "response.item.create")
+        assert ws.sent[turn + 1]["type"] == "response.create"
+
+        # decided once: more silence asks nothing again
+        _voice_audio(session, speech_ms=0, silence_ms=2000)
+        await asyncio.sleep(0.05)
+        assert len(seen) == 1
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_turn_the_app_declines_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda turn: None)
+    session = await _started(model)
+    try:
+        _caller_turn(session, "Thanks!", 0)
+        session._handle_event(_transcript("assistant", "You're welcome.", 900))
+        _voice_audio(session, speech_ms=800, silence_ms=1000)
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == []
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_delegated_turn_never_reaches_the_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[gpt_live_model.MissedDelegation] = []
+    _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: calls.append(t) or "x")
+    session = await _started(model)
+    try:
+        _caller_turn(session, "Cancel my appointment.", 0)
+        session._handle_event(_delegation_created("item_d1"))
+        session._handle_event(_transcript("assistant", "One moment.", 1000))
+        _voice_audio(session, speech_ms=600, silence_ms=1000)
+        await asyncio.sleep(0.05)
+        assert calls == []
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_delegation_while_the_app_decides_cancels_the_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _connect_hook(monkeypatch)
+    release = asyncio.Event()
+
+    async def slow_policy(turn: gpt_live_model.MissedDelegation) -> str:
+        await release.wait()
+        return turn.caller_text
+
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=slow_policy)
+    session = await _started(model)
+    try:
+        _caller_turn(session, "Please cancel.", 0)
+        session._handle_event(_transcript("assistant", "Sure.", 1000))
+        _voice_audio(session, speech_ms=500, silence_ms=1000)
+        await asyncio.sleep(0.05)
+
+        session._handle_event(_delegation_created("item_late"))
+        release.set()
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == []
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_caller_turns_before_the_reply_ends_are_judged_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str] = []
+    _connect_hook(monkeypatch)
+    model = GPTLiveModel(
+        api_key="sk-test", missed_delegation=lambda t: seen.append(t.caller_text) or None
+    )
+    session = await _started(model)
+    try:
+        _caller_turn(session, "Yes.", 0)
+        _caller_turn(session, "Just cancel it.", 3000)
+        session._handle_event(_transcript("assistant", "Alright, I'm canceling that.", 4500))
+        _voice_audio(session, speech_ms=1200, silence_ms=1000)
+        await asyncio.sleep(0.05)
+        assert seen == ["Yes.\nJust cancel it."]
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_backend_turn_waits_for_the_backend_to_be_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The backend refuses a new response while one runs, so the turn queues until it ends."""
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test")
+    session = await _started(model)
+    try:
+        session._handle_event(
+            _response_event("item_d1", {"type": "response.created", "response": {"id": "resp_1"}})
+        )
+        session.start_backend_turn("I want to cancel my appointment.")
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == []
+
+        session._handle_event(_response_event("item_d1", _completed("resp_1")))
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == ["I want to cancel my appointment."]
+
+        # one request in flight at a time: a second turn waits for the first one's response
+        session.start_backend_turn("And the other one.")
+        await asyncio.sleep(0.05)
+        assert len(_backend_turns(ws)) == 1
+        session._handle_event(
+            _response_event(None, {"type": "response.created", "response": {"id": "resp_2"}})
+        )
+        session._handle_event(_response_event(None, _completed("resp_2")))
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws)[-1] == "And the other one."
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def _fallback_with_call(
+    session: GPTLiveSession, ws: _FakeWS, calls: list[llm.FunctionCall]
+) -> None:
+    """A fallback turn whose backend calls _get_weather(Paris) once."""
+    _caller_turn(session, "Weather in Paris?", 0)
+    session._handle_event(_transcript("assistant", "Sure, one sec.", 1000))
+    _voice_audio(session, speech_ms=500, silence_ms=1000)
+    await asyncio.sleep(0.05)
+    assert _backend_turns(ws) == ["Weather in Paris?"]
+    session._handle_event(
+        _response_event(None, {"type": "response.created", "response": {"id": "resp_fb"}})
+    )
+    session._handle_event(_response_event(None, _function_call_done("call_fb")))
+    assert [c.call_id for c in calls] == ["call_fb"]
+
+
+async def test_a_late_delegation_reuses_the_fallbacks_result_instead_of_running_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delegation can lag the caller by seconds; when it lands after the fallback, the calls
+    it repeats get the fallback's results and the tools do not run twice."""
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: t.caller_text)
+    session = await _started(model)
+    calls: list[llm.FunctionCall] = []
+    session.on("function_call", calls.append)
+    try:
+        await _fallback_with_call(session, ws, calls)
+        await session._append_items(
+            [
+                llm.FunctionCallOutput(
+                    call_id="call_fb", name="_get_weather", output="rainy", is_error=False
+                )
+            ]
+        )
+        session._handle_event(_response_event(None, _completed("resp_fb")))
+        await asyncio.sleep(0.05)
+
+        session._handle_event(_delegation_created("item_late"))
+        session._handle_event(
+            _response_event("item_late", {"type": "response.created", "response": {"id": "resp_l"}})
+        )
+        session._handle_event(_response_event("item_late", _function_call_done("call_late")))
+        await asyncio.sleep(0.05)
+
+        assert [c.call_id for c in calls] == ["call_fb"]  # not dispatched a second time
+        outputs = [
+            e["item"]
+            for e in ws.sent
+            if e["type"] == "response.item.create"
+            and e["item"].get("type") == "function_call_output"
+        ]
+        assert outputs[-1] == {
+            "type": "function_call_output",
+            "call_id": "call_late",
+            "output": "rainy",
+        }
+
+        session._handle_event(_response_event("item_late", _completed("resp_l")))
+        await asyncio.sleep(0.05)
+        assert ws.sent[-1]["type"] == "response.create"
+        assert not session._backend_running_responses and not session._backend_open_calls
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_late_call_waits_for_the_fallbacks_own_call_to_finish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: t.caller_text)
+    session = await _started(model)
+    calls: list[llm.FunctionCall] = []
+    session.on("function_call", calls.append)
+    try:
+        await _fallback_with_call(session, ws, calls)
+        session._handle_event(_delegation_created("item_late"))
+        session._handle_event(
+            _response_event("item_late", {"type": "response.created", "response": {"id": "resp_l"}})
+        )
+        session._handle_event(_response_event("item_late", _function_call_done("call_late")))
+        assert [c.call_id for c in calls] == ["call_fb"]
+
+        await session._append_items(
+            [
+                llm.FunctionCallOutput(
+                    call_id="call_fb", name="_get_weather", output="rainy", is_error=False
+                )
+            ]
+        )
+        await asyncio.sleep(0.05)
+        answered = {
+            e["item"]["call_id"]: e["item"]["output"]
+            for e in ws.sent
+            if e["type"] == "response.item.create"
+            and e["item"].get("type") == "function_call_output"
+        }
+        assert answered == {"call_fb": "rainy", "call_late": "rainy"}
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_late_delegation_still_runs_calls_the_fallback_never_made(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: t.caller_text)
+    session = await _started(model)
+    calls: list[llm.FunctionCall] = []
+    session.on("function_call", calls.append)
+    try:
+        await _fallback_with_call(session, ws, calls)
+        session._handle_event(_delegation_created("item_late"))
+        other = _function_call_done("call_other")
+        other["item"]["arguments"] = '{"location": "Rome"}'
+        session._handle_event(_response_event("item_late", other))
+        assert [c.call_id for c in calls] == ["call_fb", "call_other"]
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_missed_delegation_and_backend_turns_need_responses_delegation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(ValueError, match="missed_delegation needs delegation='responses'"):
+        GPTLiveModel(api_key="sk-test", delegation="client", missed_delegation=lambda t: None)
+
+    _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test", delegation="client")
+    session = model.session()
+    try:
+        with pytest.raises(RuntimeError, match="start_backend_turn needs delegation='responses'"):
+            session.start_backend_turn("hello")
+    finally:
+        await session.aclose()
+        await model.aclose()
+
+
+async def test_a_refused_response_request_does_not_hold_the_backend_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the service refuses a response.create, no response.created follows; the next queued
+    turn must still go out."""
+    ws = _connect_hook(monkeypatch)
+    model = GPTLiveModel(api_key="sk-test")
+    session = await _started(model)
+    try:
+        session.start_backend_turn("first")
+        session.start_backend_turn("second")
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == ["first"]
+
+        refused = next(e for e in reversed(ws.sent) if e["type"] == "response.create")
+        session._handle_event(
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "conversation_busy",
+                    "message": "busy",
+                    "client_event_id": refused["event_id"],
+                },
+            }
+        )
+        await asyncio.sleep(0.05)
+        assert _backend_turns(ws) == ["first", "second"]
+    finally:
+        await session.aclose()
+        await model.aclose()
