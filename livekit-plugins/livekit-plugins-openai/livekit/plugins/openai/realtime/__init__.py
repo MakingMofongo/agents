@@ -1,11 +1,10 @@
 from . import gpt_live_types as gpt_live_types, utils as utils
 from .gpt_live_model import (
+    GPTLiveBackendDelegation,
     GPTLiveDelegation,
     GPTLiveModel,
     GPTLiveSession,
     GPTLiveVoices,
-    MissedDelegation,
-    MissedDelegationHandler,
     ResponsesDelegationOptions,
 )
 from .inference_realtime_model import InferenceRealtimeModel
@@ -18,9 +17,8 @@ __all__ = [
     "GPTLiveModel",
     "GPTLiveSession",
     "GPTLiveDelegation",
+    "GPTLiveBackendDelegation",
     "GPTLiveVoices",
-    "MissedDelegation",
-    "MissedDelegationHandler",
     "ResponsesDelegationOptions",
 ]
 
