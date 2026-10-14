@@ -2516,26 +2516,25 @@ async def test_a_waiting_delegations_first_response_is_not_taken_for_the_continu
         await model.aclose()
 
 
-async def test_a_turn_spoken_over_the_voice_is_judged_on_the_reply_after_it(
+async def test_a_turn_spoken_over_the_voice_is_judged_when_that_utterance_ends(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The caller answers over the voice's readback; the end of the readback is not the reply."""
+    """The caller answers over the voice relaying the backend's question ("Yes, just cancel it"
+    over "would you rather cancel or reschedule?"); the voice model may never delegate it, so the
+    turn is judged when that utterance ends, marked as spoken over."""
     seen: list[gpt_live_model.MissedDelegation] = []
     _connect_hook(monkeypatch)
     model = GPTLiveModel(api_key="sk-test", missed_delegation=lambda t: seen.append(t) or None)
     session = await _started(model)
     try:
-        _voice_audio(session, speech_ms=1500, silence_ms=0)  # the readback, still going
-        _caller_turn(session, "Yes, that one. Please cancel.", 0)
-        _voice_audio(session, speech_ms=500, silence_ms=1000)  # the readback ends
+        _voice_audio(session, speech_ms=1500, silence_ms=0)  # the offer, still going
+        session._handle_event(_transcript("assistant", "Would you rather cancel or", 0))
+        _caller_turn(session, "Yes. Just cancel it.", 1000)
+        session._handle_event(_transcript("assistant", " reschedule?", 2500))
+        _voice_audio(session, speech_ms=500, silence_ms=1000)  # the offer ends
         await asyncio.sleep(0.05)
-        assert seen == []
-
-        session._handle_event(_transcript("assistant", "Sure. I'll take care of it.", 4000))
-        _voice_audio(session, speech_ms=1200, silence_ms=1000)
-        await asyncio.sleep(0.05)
-        assert [(t.caller_text, t.voice_reply) for t in seen] == [
-            ("Yes, that one. Please cancel.", "Sure. I'll take care of it.")
+        assert [(t.caller_text, t.voice_reply, t.spoken_over) for t in seen] == [
+            ("Yes. Just cancel it.", " reschedule?", True)
         ]
     finally:
         await session.aclose()

@@ -132,6 +132,9 @@ class MissedDelegation:
     """What the caller said, with turns joined by newlines when several went undelegated."""
     voice_reply: str
     """What the voice model said back, so a policy can tell "I'll cancel that" from "Bye"."""
+    spoken_over: bool = False
+    """The caller spoke over the voice model, usually answering the question it was asking; the
+    voice model may still delegate late, so a policy may want to wait a little longer."""
 
 
 MissedDelegationHandler = Callable[[MissedDelegation], "str | None | Awaitable[str | None]"]
@@ -157,7 +160,7 @@ class _PendingTurn:
     delegations_before: int = 0
     """The delegation count when the voice model's last reply before this turn ended."""
     voice_mid_utterance: bool = False
-    """The voice model was still talking when the turn ended: that utterance is not the reply."""
+    """The caller spoke over an utterance the voice model had already begun."""
     caller_started_at: float = 0.0
     """Wall-clock time the caller began this turn."""
 
@@ -941,12 +944,6 @@ class GPTLiveSession(
         self._delegations_at_reply_end = self._delegations_seen
         if (turn := self._pending_turn) is None:
             return
-        if turn.voice_mid_utterance:
-            # the caller spoke over this utterance, which began before their turn; the reply
-            # to judge is the next one
-            turn.voice_mid_utterance = False
-            turn.voice_text = ""
-            return
         self._pending_turn = None
         # a delegation anywhere since the voice model's previous reply ended covers this turn:
         # it can land before the caller's first fragment, or split their turn in two
@@ -1600,7 +1597,11 @@ class GPTLiveSession(
         async def _decide() -> None:
             try:
                 result = handler(
-                    MissedDelegation(caller_text=turn.caller_text, voice_reply=turn.voice_text)
+                    MissedDelegation(
+                        caller_text=turn.caller_text,
+                        voice_reply=turn.voice_text,
+                        spoken_over=turn.voice_mid_utterance,
+                    )
                 )
                 if inspect.isawaitable(result):
                     result = await result
